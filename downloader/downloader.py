@@ -313,6 +313,18 @@ class Downloader:
         host = domain.split(":", 1)[0].lower()
         return host == "kemono.cr" or host == "kemono.su" or host.endswith(".kemono.cr") or host.endswith(".kemono.su")
 
+    def _get_ck_cache_key(self, url):
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").split(":", 1)[0].lower()
+        path = parsed.path or "/"
+
+        if host.startswith("n") and "." in host:
+            prefix, remainder = host.split(".", 1)
+            if len(prefix) > 1 and prefix[1:].isdigit():
+                host = remainder
+
+        return f"{host}{path}"
+
     def _wait_for_domain_cooldown(self, domain):
         while True:
             if self.cancel_requested.is_set():
@@ -371,7 +383,6 @@ class Downloader:
 
         parsed = urlparse(url)
         domain = parsed.netloc
-        path = parsed.path
 
         for attempt in range(max_retries + 1):
             if self.cancel_requested.is_set():
@@ -399,12 +410,13 @@ class Downloader:
                         if self.update_progress_callback:
                             self.update_progress_callback(0, 0, status=f"{sc} - probing subdomains")
 
-                        with self.subdomain_locks[path]:
-                            if path in self.subdomain_cache:
-                                alt_url = self.subdomain_cache[path]
+                        cache_key = self._get_ck_cache_key(url)
+                        with self.subdomain_locks[cache_key]:
+                            if cache_key in self.subdomain_cache:
+                                alt_url = self.subdomain_cache[cache_key]
                             else:
                                 alt_url = self._find_valid_subdomain(url)
-                                self.subdomain_cache[path] = alt_url
+                                self.subdomain_cache[cache_key] = alt_url
 
                         if alt_url != url:
                             found = urlparse(alt_url).netloc
@@ -449,7 +461,6 @@ class Downloader:
                     failed_url = getattr(getattr(e, "request", None), "url", url)
                     failed_parsed = urlparse(failed_url)
                     failed_domain = failed_parsed.netloc
-                    failed_path = failed_parsed.path or path
 
                     if status_code in (429, 500, 502, 503, 504):
                         self._mark_domain_error(domain, status_code)
@@ -465,12 +476,13 @@ class Downloader:
                             time.sleep(self._compute_retry_delay(attempt))
 
                     elif status_code is None and self._is_ck_domain(failed_domain):
-                        with self.subdomain_locks[failed_path]:
-                            if failed_path in self.subdomain_cache:
-                                alt_url = self.subdomain_cache[failed_path]
+                        cache_key = self._get_ck_cache_key(failed_url)
+                        with self.subdomain_locks[cache_key]:
+                            if cache_key in self.subdomain_cache:
+                                alt_url = self.subdomain_cache[cache_key]
                             else:
                                 alt_url = self._find_valid_subdomain(failed_url)
-                                self.subdomain_cache[failed_path] = alt_url
+                                self.subdomain_cache[cache_key] = alt_url
 
                         if alt_url != failed_url:
                             try:
@@ -558,8 +570,7 @@ class Downloader:
                             timeout=self.request_timeout,
                             stream=True,
                         )
-                        # 206 is valid for ranged/partial media responses used during resume flows.
-                        if resp.status_code in (200, 206):
+                        if resp.status_code == 200:
                             return test_url
                     except Exception:
                         pass
