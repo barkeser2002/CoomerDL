@@ -427,6 +427,10 @@ class Downloader:
 
                 except requests.exceptions.RequestException as e:
                     status_code = getattr(e.response, "status_code", None)
+                    failed_url = getattr(e.request, "url", url)
+                    failed_parsed = urlparse(failed_url)
+                    failed_domain = failed_parsed.netloc
+                    failed_path = failed_parsed.path or path
 
                     if status_code in (429, 500, 502, 503, 504):
                         self._mark_domain_error(domain, status_code)
@@ -441,8 +445,34 @@ class Downloader:
                         if attempt < max_retries:
                             time.sleep(self._compute_retry_delay(attempt))
 
+                    elif status_code is None and ("coomer" in failed_domain or "kemono" in failed_domain):
+                        with self.subdomain_locks[failed_path]:
+                            if failed_path in self.subdomain_cache:
+                                alt_url = self.subdomain_cache[failed_path]
+                            else:
+                                alt_url = self._find_valid_subdomain(failed_url)
+                                self.subdomain_cache[failed_path] = alt_url
+
+                        if alt_url != failed_url:
+                            try:
+                                alt_domain = urlparse(alt_url).netloc
+                                if not self._wait_for_domain_cooldown(alt_domain):
+                                    return None
+
+                                response = self.session.get(
+                                    alt_url,
+                                    stream=True,
+                                    headers=headers,
+                                    timeout=self.request_timeout,
+                                )
+                                response.raise_for_status()
+                                self._mark_domain_success(alt_domain)
+                                return response
+                            except requests.exceptions.RequestException:
+                                pass
+
                     elif status_code not in (403, 404):
-                        url_display = getattr(e.request, "url", url)
+                        url_display = failed_url
                         if len(url_display) > 60:
                             url_display = url_display[:60] + "..."
                         self.log(
@@ -469,38 +499,50 @@ class Downloader:
         parsed = urlparse(url)
         original_path = parsed.path
 
-        path = original_path
-        if not original_path.startswith("/data/"):
-            path = ("/data" + original_path) if not original_path.startswith("/data") else original_path
+        candidate_paths = []
+        if original_path:
+            candidate_paths.append(original_path)
+        if original_path.startswith("/data/"):
+            candidate_paths.append(original_path[len("/data"):])
+        else:
+            normalized = original_path if original_path.startswith("/") else f"/{original_path}"
+            candidate_paths.append(f"/data{normalized}")
+        candidate_paths = [p for p in dict.fromkeys(candidate_paths) if p]
 
         host = parsed.netloc
+        if host.startswith("n") and "." in host:
+            prefix, remainder = host.split(".", 1)
+            if prefix[1:].isdigit():
+                host = remainder
 
         if "coomer" in host:
-            base_domains = ["coomer.st"]
+            base_domains = [host, "coomer.st", "coomer.su"]
         elif "kemono" in host:
-            base_domains = ["kemono.cr", "kemono.su"]
+            base_domains = [host, "kemono.cr", "kemono.su"]
         else:
             base_domains = [host]
+        base_domains = list(dict.fromkeys(base_domains))
 
         for base in base_domains:
-            for i in range(1, max_subdomains + 1):
-                domain = f"n{i}.{base}"
-                test_url = parsed._replace(netloc=domain, path=path).geturl()
+            candidate_domains = [base] + [f"n{i}.{base}" for i in range(1, max_subdomains + 1)]
+            for domain in candidate_domains:
+                for path in candidate_paths:
+                    test_url = parsed._replace(netloc=domain, path=path).geturl()
 
-                if self.update_progress_callback:
-                    self.update_progress_callback(0, 0, status=f"Testing subdomain: {domain}")
+                    if self.update_progress_callback:
+                        self.update_progress_callback(0, 0, status=f"Testing subdomain: {domain}")
 
-                try:
-                    resp = self.session.get(
-                        test_url,
-                        headers=self.headers,
-                        timeout=self.request_timeout,
-                        stream=True,
-                    )
-                    if resp.status_code == 200:
-                        return test_url
-                except Exception:
-                    pass
+                    try:
+                        resp = self.session.get(
+                            test_url,
+                            headers=self.headers,
+                            timeout=self.request_timeout,
+                            stream=True,
+                        )
+                        if resp.status_code in (200, 206):
+                            return test_url
+                    except Exception:
+                        pass
 
         return url
 
