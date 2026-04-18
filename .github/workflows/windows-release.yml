@@ -1,0 +1,74 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "V*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v1.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable (PyInstaller)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name CoomerDL --icon resources/img/icono.ico main.py
+
+      - name: Include runtime resources
+        shell: pwsh
+        run: |
+          New-Item -Path "dist/CoomerDL/resources" -ItemType Directory -Force | Out-Null
+          Copy-Item -Path "resources/*" -Destination "dist/CoomerDL/resources" -Recurse -Force
+
+      - name: Create release archive
+        id: archive
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = "${{ github.ref_name }}"
+          }
+          $assetName = "CoomerDL-$tag-windows.zip"
+          Compress-Archive -Path "dist/CoomerDL/*" -DestinationPath $assetName -Force
+          "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coomerdl-windows-build
+          path: ${{ steps.archive.outputs.asset_name }}
+
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.archive.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: ${{ steps.archive.outputs.asset_name }}

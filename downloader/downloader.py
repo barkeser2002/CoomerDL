@@ -294,6 +294,37 @@ class Downloader:
         base = max(float(self.retry_interval or 0), 0.1)
         return (base * (attempt_index + 1)) + random.uniform(0.35, 1.15)
 
+    def _is_ck_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        known_roots = ("coomer.st", "coomer.su", "kemono.cr", "kemono.su")
+        return any(host == root or host.endswith(f".{root}") for root in known_roots)
+
+    def _is_coomer_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        return host == "coomer.st" or host == "coomer.su" or host.endswith(".coomer.st") or host.endswith(".coomer.su")
+
+    def _is_kemono_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        return host == "kemono.cr" or host == "kemono.su" or host.endswith(".kemono.cr") or host.endswith(".kemono.su")
+
+    def _get_ck_cache_key(self, url):
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").split(":", 1)[0].lower()
+        path = parsed.path or "/"
+
+        if host.startswith("n") and "." in host:
+            prefix, remainder = host.split(".", 1)
+            if len(prefix) > 1 and prefix[1:].isdigit():
+                host = remainder
+
+        return f"{host}{path}"
+
     def _wait_for_domain_cooldown(self, domain):
         while True:
             if self.cancel_requested.is_set():
@@ -352,7 +383,6 @@ class Downloader:
 
         parsed = urlparse(url)
         domain = parsed.netloc
-        path = parsed.path
 
         for attempt in range(max_retries + 1):
             if self.cancel_requested.is_set():
@@ -376,16 +406,17 @@ class Downloader:
                     )
                     sc = response.status_code
 
-                    if sc in (403, 404) and ("coomer" in domain or "kemono" in domain):
+                    if sc in (403, 404) and self._is_ck_domain(domain):
                         if self.update_progress_callback:
                             self.update_progress_callback(0, 0, status=f"{sc} - probing subdomains")
 
-                        with self.subdomain_locks[path]:
-                            if path in self.subdomain_cache:
-                                alt_url = self.subdomain_cache[path]
+                        cache_key = self._get_ck_cache_key(url)
+                        with self.subdomain_locks[cache_key]:
+                            if cache_key in self.subdomain_cache:
+                                alt_url = self.subdomain_cache[cache_key]
                             else:
                                 alt_url = self._find_valid_subdomain(url)
-                                self.subdomain_cache[path] = alt_url
+                                self.subdomain_cache[cache_key] = alt_url
 
                         if alt_url != url:
                             found = urlparse(alt_url).netloc
@@ -427,6 +458,9 @@ class Downloader:
 
                 except requests.exceptions.RequestException as e:
                     status_code = getattr(e.response, "status_code", None)
+                    failed_url = getattr(getattr(e, "request", None), "url", url)
+                    failed_parsed = urlparse(failed_url)
+                    failed_domain = failed_parsed.netloc
 
                     if status_code in (429, 500, 502, 503, 504):
                         self._mark_domain_error(domain, status_code)
@@ -441,8 +475,35 @@ class Downloader:
                         if attempt < max_retries:
                             time.sleep(self._compute_retry_delay(attempt))
 
+                    elif status_code is None and self._is_ck_domain(failed_domain):
+                        cache_key = self._get_ck_cache_key(failed_url)
+                        with self.subdomain_locks[cache_key]:
+                            if cache_key in self.subdomain_cache:
+                                alt_url = self.subdomain_cache[cache_key]
+                            else:
+                                alt_url = self._find_valid_subdomain(failed_url)
+                                self.subdomain_cache[cache_key] = alt_url
+
+                        if alt_url != failed_url:
+                            try:
+                                alt_domain = urlparse(alt_url).netloc
+                                if not self._wait_for_domain_cooldown(alt_domain):
+                                    return None
+
+                                response = self.session.get(
+                                    alt_url,
+                                    stream=True,
+                                    headers=headers,
+                                    timeout=self.request_timeout,
+                                )
+                                response.raise_for_status()
+                                self._mark_domain_success(alt_domain)
+                                return response
+                            except requests.exceptions.RequestException:
+                                pass
+
                     elif status_code not in (403, 404):
-                        url_display = getattr(e.request, "url", url)
+                        url_display = failed_url
                         if len(url_display) > 60:
                             url_display = url_display[:60] + "..."
                         self.log(
@@ -456,7 +517,7 @@ class Downloader:
                         if attempt < max_retries:
                             time.sleep(self._compute_retry_delay(attempt))
 
-                    if status_code in (403, 404) and ("coomer" in domain or "kemono" in domain) and attempt == max_retries:
+                    if status_code in (403, 404) and self._is_ck_domain(domain) and attempt == max_retries:
                         self.log(
                             "FINAL_FAILURE_ACCESSING_URL",
                             url=url,
@@ -469,38 +530,50 @@ class Downloader:
         parsed = urlparse(url)
         original_path = parsed.path
 
-        path = original_path
-        if not original_path.startswith("/data/"):
-            path = ("/data" + original_path) if not original_path.startswith("/data") else original_path
+        candidate_paths = []
+        if original_path:
+            candidate_paths.append(original_path)
+        if original_path.startswith("/data/"):
+            candidate_paths.append(original_path[len("/data"):])
+        else:
+            normalized = original_path if original_path.startswith("/") else f"/{original_path}"
+            candidate_paths.append(f"/data{normalized}")
+        candidate_paths = [p for p in dict.fromkeys(candidate_paths) if p]
 
         host = parsed.netloc
+        if host.startswith("n") and "." in host:
+            prefix, remainder = host.split(".", 1)
+            if len(prefix) > 1 and prefix[1:].isdigit():
+                host = remainder
 
-        if "coomer" in host:
-            base_domains = ["coomer.st"]
-        elif "kemono" in host:
-            base_domains = ["kemono.cr", "kemono.su"]
+        if self._is_coomer_domain(host):
+            base_domains = [host, "coomer.st", "coomer.su"]
+        elif self._is_kemono_domain(host):
+            base_domains = [host, "kemono.cr", "kemono.su"]
         else:
             base_domains = [host]
+        base_domains = list(dict.fromkeys(base_domains))
 
         for base in base_domains:
-            for i in range(1, max_subdomains + 1):
-                domain = f"n{i}.{base}"
-                test_url = parsed._replace(netloc=domain, path=path).geturl()
+            candidate_domains = [base] + [f"n{i}.{base}" for i in range(1, max_subdomains + 1)]
+            for domain in candidate_domains:
+                for path in candidate_paths:
+                    test_url = parsed._replace(netloc=domain, path=path).geturl()
 
-                if self.update_progress_callback:
-                    self.update_progress_callback(0, 0, status=f"Testing subdomain: {domain}")
+                    if self.update_progress_callback:
+                        self.update_progress_callback(0, 0, status=f"Testing subdomain: {domain}")
 
-                try:
-                    resp = self.session.get(
-                        test_url,
-                        headers=self.headers,
-                        timeout=self.request_timeout,
-                        stream=True,
-                    )
-                    if resp.status_code == 200:
-                        return test_url
-                except Exception:
-                    pass
+                    try:
+                        resp = self.session.get(
+                            test_url,
+                            headers=self.headers,
+                            timeout=self.request_timeout,
+                            stream=True,
+                        )
+                        if resp.status_code == 200:
+                            return test_url
+                    except Exception:
+                        pass
 
         return url
 
