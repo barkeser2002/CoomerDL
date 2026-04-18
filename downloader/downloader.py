@@ -539,6 +539,7 @@ class Downloader:
                             timeout=self.request_timeout,
                             stream=True,
                         )
+                        # 206 is valid for ranged/partial media responses used during resume flows.
                         if resp.status_code in (200, 206):
                             return test_url
                     except Exception:
