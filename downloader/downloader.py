@@ -294,6 +294,25 @@ class Downloader:
         base = max(float(self.retry_interval or 0), 0.1)
         return (base * (attempt_index + 1)) + random.uniform(0.35, 1.15)
 
+    def _is_ck_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        known_roots = ("coomer.st", "coomer.su", "kemono.cr", "kemono.su")
+        return any(host == root or host.endswith(f".{root}") for root in known_roots)
+
+    def _is_coomer_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        return host == "coomer.st" or host == "coomer.su" or host.endswith(".coomer.st") or host.endswith(".coomer.su")
+
+    def _is_kemono_domain(self, domain):
+        if not domain:
+            return False
+        host = domain.split(":", 1)[0].lower()
+        return host == "kemono.cr" or host == "kemono.su" or host.endswith(".kemono.cr") or host.endswith(".kemono.su")
+
     def _wait_for_domain_cooldown(self, domain):
         while True:
             if self.cancel_requested.is_set():
@@ -376,7 +395,7 @@ class Downloader:
                     )
                     sc = response.status_code
 
-                    if sc in (403, 404) and ("coomer" in domain or "kemono" in domain):
+                    if sc in (403, 404) and self._is_ck_domain(domain):
                         if self.update_progress_callback:
                             self.update_progress_callback(0, 0, status=f"{sc} - probing subdomains")
 
@@ -427,7 +446,7 @@ class Downloader:
 
                 except requests.exceptions.RequestException as e:
                     status_code = getattr(e.response, "status_code", None)
-                    failed_url = getattr(e.request, "url", url)
+                    failed_url = getattr(getattr(e, "request", None), "url", url)
                     failed_parsed = urlparse(failed_url)
                     failed_domain = failed_parsed.netloc
                     failed_path = failed_parsed.path or path
@@ -445,7 +464,7 @@ class Downloader:
                         if attempt < max_retries:
                             time.sleep(self._compute_retry_delay(attempt))
 
-                    elif status_code is None and ("coomer" in failed_domain or "kemono" in failed_domain):
+                    elif status_code is None and self._is_ck_domain(failed_domain):
                         with self.subdomain_locks[failed_path]:
                             if failed_path in self.subdomain_cache:
                                 alt_url = self.subdomain_cache[failed_path]
@@ -486,7 +505,7 @@ class Downloader:
                         if attempt < max_retries:
                             time.sleep(self._compute_retry_delay(attempt))
 
-                    if status_code in (403, 404) and ("coomer" in domain or "kemono" in domain) and attempt == max_retries:
+                    if status_code in (403, 404) and self._is_ck_domain(domain) and attempt == max_retries:
                         self.log(
                             "FINAL_FAILURE_ACCESSING_URL",
                             url=url,
@@ -512,12 +531,12 @@ class Downloader:
         host = parsed.netloc
         if host.startswith("n") and "." in host:
             prefix, remainder = host.split(".", 1)
-            if prefix[1:].isdigit():
+            if len(prefix) > 1 and prefix[1:].isdigit():
                 host = remainder
 
-        if "coomer" in host:
+        if self._is_coomer_domain(host):
             base_domains = [host, "coomer.st", "coomer.su"]
-        elif "kemono" in host:
+        elif self._is_kemono_domain(host):
             base_domains = [host, "kemono.cr", "kemono.su"]
         else:
             base_domains = [host]
